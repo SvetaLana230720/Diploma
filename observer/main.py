@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
-"""Raspberry Pi meter‑watcher
+"""Raspberry Pi meter‑watcher (per‑device subscribers)
 
-Скрипт делает снимок с камеры через заданный интервал и отправляет
-фото (и/или цифровое значение) всем пользователям, зарегистрированным
-в Telegram‑боте simple_telegram_bot.py.
+Снимает кадр с USB‑камеры, раз в `PERIOD` секунд отправляет его
+пользователям, подписанным **именно на этот Raspberry Pi**.
 
-Ключевые фишки
-==============
-* **Автопоиск USB‑камеры**: если `CAM_ID=auto` (по умолчанию),
-  скрипт сам найдёт первое устройство `/dev/video*`, которое открывается.
-* Легковесная рассылка фото/значений в зарегистрированные чаты.
-
-Зависимости:
-  pip install opencv-python python-telegram-bot
-
-Переменные окружения:
-  BOT_TOKEN  – токен Вашего бота
-  PERIOD     – период в секундах между кадрами (по умолчанию 3600)
-  CAM_ID     – индекс/путь к камере (по умолчанию 0)
-  IMG_DIR    – куда складывать кадры (по умолчанию /tmp/meter_frames)
-
-Формат хранилища зарегистрированных чатов тот же, что и у бота –
-JSON‑файл registered_users.json в рабочем каталоге.
+* REST‑реестр хранит связи *device_id ↔ chat_id*.
+* Pi спрашивает `/subscribers/{DEVICE_ID}` и шлёт только своим.
+* Один объект `Bot` reused для всех отправок → меньше TLS‑handshake.
 """
-
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -35,8 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-import cv2  # OpenCV
-from telegram import Bot
+import cv2                 # OpenCV
+import requests            # REST‑запросы к реестру
+from telegram import Bot, InputFile
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -44,57 +28,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Конфигурация из ENV --------------------
+# -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Environment variable BOT_TOKEN is not set")
+    raise RuntimeError("BOT_TOKEN is not set")
 
-PERIOD = int(os.getenv("PERIOD", "3600"))  # default: 1 час
-CAM_ID = os.getenv("CAM_ID", "0")  # "0" -> /dev/video0
+DEVICE_ID = os.getenv("DEVICE_ID")  # уникальный ID этой Pi
+if not DEVICE_ID:
+    raise RuntimeError("DEVICE_ID is not set")
+
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
+
+PERIOD  = int(os.getenv("PERIOD", "3600"))              # секунд
+CAM_ID  = os.getenv("CAM_ID", "auto")                    # auto|0|/dev/video1
 IMG_DIR = Path(os.getenv("IMG_DIR", "/tmp/meter_frames"))
 IMG_DIR.mkdir(parents=True, exist_ok=True)
-USERS_FILE = Path("registered_users.json")
 
-# -------------------------------------------------------------
-# --- helpers for sending data back to Telegram ----------------
+bot = Bot(BOT_TOKEN)  # создаём один экземпляр на всё время работы
+
+# -------------- subscribers from registry ---------------
 
 def _load_users() -> List[int]:
-    if USERS_FILE.exists():
-        try:
-            return json.loads(USERS_FILE.read_text("utf-8"))
-        except Exception as exc:
-            logger.error("Failed to parse %s: %s", USERS_FILE, exc)
-    return []
+    try:
+        url = f"{REGISTRY_URL}/subscribers/{DEVICE_ID}"
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        return r.json()  # list[int]
+    except Exception as exc:
+        logger.error("Registry error: %s", exc)
+        return []
+
+# -------------- telegram send ----------------------------
+
+# -------------- telegram send ----------------------------
+async def _send_to_chat(chat_id: int, caption: str | None, photo_path: str | None):
+    try:
+        if photo_path:
+            # Открываем файл внутри каждой отправки
+            with open(photo_path, "rb") as f:
+                await bot.send_photo(chat_id, photo=f, caption=caption)
+        else:
+            await bot.send_message(chat_id, text=caption or "(пустое сообщение)")
+    except Exception as exc:
+        logger.error("Telegram send error to %s: %s", chat_id, exc)
 
 
-async def _push_to_chat(bot_token: str, chat_id: int, value: float | None, photo: str | None):
-    bot = Bot(bot_token)
-    async with bot:
-        if photo:
-            caption = f"Текущие показания: {value}" if value is not None else None
-            await bot.send_photo(chat_id, photo=open(photo, "rb"), caption=caption)
-        elif value is not None:
-            await bot.send_message(chat_id, text=f"Текущие показания: {value}")
 
-
-def notify_user(bot_token: str, value: float | None = None, photo_path: str | None = None) -> None:
-    """Разослать `value` и/или `photo_path` всем зарегистрированным чатам."""
+def notify_users(value: float | None = None, photo_path: str | None = None) -> None:
+    """Рассылаем фото/значение только своим подписчикам."""
     chats = _load_users()
     if not chats:
-        logger.warning("No registered users – nothing to send.")
+        logger.warning("No subscribers for %s", DEVICE_ID)
         return
 
+    caption = f"Текущие показания: {value}" if value is not None else None
+    # photo: InputFile | None = None
+    # if photo_path:
+    #     photo = InputFile(photo_path, filename=Path(photo_path).name)
+
     async def _run():
-        await asyncio.gather(*[_push_to_chat(bot_token, cid, value, photo_path) for cid in chats])
+        await asyncio.gather(*[
+            _send_to_chat(cid, caption, photo_path) for cid in chats
+        ])
+
 
     asyncio.run(_run())
 
-# -------------------------------------------------------------
-# --------- работа с камерой и основной цикл ------------------
+# -------------- camera helpers ---------------------------
+
+def _resolve_cam() -> int | str:
+    if CAM_ID.lower() == "auto":
+        return cv2.CAP_ANY  # OpenCV выберет первую доступную
+    return int(CAM_ID) if CAM_ID.isdigit() else CAM_ID
+
+CAM_SRC = _resolve_cam()
+logger.info("Using camera source: %s", CAM_SRC)
+
 
 def capture_frame() -> Path:
-    """Снять кадр с камеры и сохранить в IMG_DIR."""
-    cam_index = int(CAM_ID) if CAM_ID.isdigit() else CAM_ID
     cap = cv2.VideoCapture(2)
     if not cap.isOpened():
         raise RuntimeError(f"Camera {CAM_ID} not available")
@@ -102,24 +113,37 @@ def capture_frame() -> Path:
     ret, frame = cap.read()
     cap.release()
     if not ret:
-        raise RuntimeError("Failed to grab frame from camera")
+        raise RuntimeError("Failed to grab frame")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = IMG_DIR / f"meter_{ts}.jpg"
     cv2.imwrite(str(img_path), frame)
     return img_path
 
+# ---------------------- main loop ------------------------
+
+def _register_device():
+    try:
+        requests.post(
+            f"{REGISTRY_URL}/devices",
+            json={"device_id": DEVICE_ID},
+            timeout=5
+        )
+    except Exception as exc:
+        logger.error("Device register error: %s", exc)
+
 
 def main() -> None:
-    logger.info("Meter watcher started – every %s s", PERIOD)
+    logger.info("Watcher %s started, period=%s s", DEVICE_ID, PERIOD)
+    _register_device()
     while True:
         try:
             img = capture_frame()
             logger.info("Captured %s", img)
-            notify_user(BOT_TOKEN, photo_path=str(img))
-            logger.info("Photo sent via Telegram")
+            notify_users(photo_path=str(img))
+            logger.info("Sent to subscribers: %s", _load_users())
         except Exception as exc:
-            logger.exception("Error: %s", exc)
+            logger.exception("Loop error: %s", exc)
         time.sleep(PERIOD)
 
 
